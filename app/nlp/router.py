@@ -63,7 +63,17 @@ def _parse_ru_date_range(text: str) -> Optional[Tuple[date, date]]:
 
 def build_query(text: str) -> Query | None:
     t = (text or "").strip().lower()
-
+    # ===== НЕГАТИВНЫЙ ПРИРОСТ (замеры/снапшоты) =====
+    # "Сколько всего есть замеров статистики..., где просмотров за час оказалось отрицательным..."
+    if (
+            "сколько" in t
+            and ("замер" in t or "снапшот" in t or "сним" in t or "почас" in t or "статистик" in t)
+            and ("отриц" in t or "меньше" in t or "уменьш" in t)
+            and "просмотр" in t
+    ):
+        return Query(
+            "SELECT COUNT(*)::bigint AS value FROM video_snapshots WHERE delta_views_count < 0"
+        )
     # ===== БАЗА =====
 
     # Сколько всего видео
@@ -91,10 +101,43 @@ def build_query(text: str) -> Query | None:
             (creator_id, d1, d2),
         )
 
+    # ===== ПОРОГИ + ФИЛЬТР ПО КРЕАТОРУ (итоговая статистика) =====
+    # "Сколько видео у креатора с id X набрали больше 10 000 просмотров по итоговой статистике?"
+    m_id = re.search(
+        r"(?:автор(?:а)?|креатор(?:а)?)(?:\s+с)?(?:\s+id)?\s+([a-z0-9_\-]+)",
+        t
+    )
+    m_thr = re.search(r"(?:больше|более|>=|не меньше|от)\s*([\d\s]+)", t)
+
+    if (
+            "сколько" in t
+            and "видео" in t
+            and "просмотр" in t
+            and m_id
+            and m_thr
+    ):
+        creator_id = m_id.group(1)
+        n = _to_int(m_thr.group(1))
+
+        if "не меньше" in t or ">=" in t or "от" in t:
+            op = ">="
+        else:
+            op = ">"
+
+        return Query(
+            """
+            SELECT COUNT(*)::bigint AS value
+            FROM videos
+            WHERE creator_id = $1
+              AND views_count {} $2
+            """.format(op),
+            (creator_id, n),
+        )
+
     # ===== ПОРОГИ (просмотры/лайки/комменты/репорты) ПО videos.*_count =====
     # "Сколько видео набрало больше 100 000 просмотров за всё время?"
     m_thr = re.search(r"(?:больше|более|>=|не меньше|от)\s*([\d\s]+)", t)
-    if "сколько" in t and "видео" in t and m_thr:
+    if "сколько" in t and "видео" in t and m_thr and not m_id:
         n = _to_int(m_thr.group(1))
         if "просмотр" in t:
             return Query("SELECT COUNT(*)::bigint AS value FROM videos WHERE views_count >= $1", (n,))

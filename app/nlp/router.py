@@ -13,6 +13,11 @@ MONTHS = {
     "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
 
+MONTHS_LOC = {
+    "январе": 1, "феврале": 2, "марте": 3, "апреле": 4, "мае": 5, "июне": 6,
+    "июле": 7, "августе": 8, "сентябре": 9, "октябре": 10, "ноябре": 11, "декабре": 12,
+}
+
 def _to_int(num_text: str) -> int:
     # "100 000" -> 100000
     return int(re.sub(r"\s+", "", num_text))
@@ -60,6 +65,18 @@ def _parse_ru_date_range(text: str) -> Optional[Tuple[date, date]]:
         return date(y, mon, d1), date(y, mon, d2)
 
     return None
+
+def _parse_ru_month_year(text: str) -> Optional[tuple[int, int]]:
+    t = text.lower()
+    m = re.search(
+        r"\bв\s+(январе|феврале|марте|апреле|мае|июне|июле|августе|сентябре|октябре|ноябре|декабре)\s+(\d{4})\b",
+        t
+    )
+    if not m:
+        return None
+    mon = MONTHS_LOC[m.group(1)]
+    year = int(m.group(2))
+    return year, mon
 
 def build_query(text: str) -> Query | None:
     t = (text or "").strip().lower()
@@ -139,8 +156,12 @@ def build_query(text: str) -> Query | None:
     m_thr = re.search(r"(?:больше|более|>=|не меньше|от)\s*([\d\s]+)", t)
     if "сколько" in t and "видео" in t and m_thr and not m_id:
         n = _to_int(m_thr.group(1))
+        if "не меньше" in t or ">=" in t or "от" in t:
+            op = ">="
+        else:
+            op = ">"  # "больше/более"
         if "просмотр" in t:
-            return Query("SELECT COUNT(*)::bigint AS value FROM videos WHERE views_count >= $1", (n,))
+            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE views_count {op} $1", (n,))
         if "лайк" in t:
             return Query("SELECT COUNT(*)::bigint AS value FROM videos WHERE likes_count >= $1", (n,))
         if "коммент" in t:
@@ -149,6 +170,28 @@ def build_query(text: str) -> Query | None:
             return Query("SELECT COUNT(*)::bigint AS value FROM videos WHERE reports_count >= $1", (n,))
 
     # ===== СУММЫ И ТОПЫ (итоговые) =====
+    my = _parse_ru_month_year(t)
+    if (
+            my
+            and "видео" in t
+            and "просмотр" in t
+    ):
+        y, m = my
+        start = date(y, m, 1)
+        if m == 12:
+            end = date(y + 1, 1, 1)
+        else:
+            end = date(y, m + 1, 1)
+
+        return Query(
+            """
+            SELECT COALESCE(SUM(views_count),0)::bigint AS value
+            FROM videos
+            WHERE video_created_at::date >= $1
+              AND video_created_at::date <  $2
+            """,
+            (start, end),
+        )
 
     if "сколько" in t and "просмотр" in t and ("всего" in t or "в системе" in t):
         return Query("SELECT COALESCE(SUM(views_count),0)::bigint AS value FROM videos")

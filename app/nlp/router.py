@@ -18,9 +18,28 @@ MONTHS_LOC = {
     "июле": 7, "августе": 8, "сентябре": 9, "октябре": 10, "ноябре": 11, "декабре": 12,
 }
 
-def _to_int(num_text: str) -> int:
-    # "100 000" -> 100000
-    return int(re.sub(r"\s+", "", num_text))
+def _to_int(num_text: str) -> Optional[int]:
+    # Берём только цифры. Если цифр нет — None.
+    digits = re.sub(r"\D+", "", num_text or "")
+    return int(digits) if digits else None
+
+def _parse_threshold(t: str) -> Optional[tuple[str, int]]:
+    """
+    Возвращает (op, n) где op: '>' или '>='.
+    Ищет конструкции:
+      больше|более|не меньше|>=|от  + число (с пробелами)
+    """
+    m = re.search(r"(больше|более|не меньше|>=|от)\s*([\d][\d\s]*)", t)
+    if not m:
+        return None
+
+    word = m.group(1)
+    n = _to_int(m.group(2))
+    if n is None:
+        return None
+
+    op = ">=" if word in ("не меньше", ">=", "от") else ">"
+    return op, n
 
 def _parse_ru_date(s: str) -> Optional[date]:
     """
@@ -112,26 +131,13 @@ def build_query(text: str) -> Query | None:
         )
 
     # ===== ПОРОГ ПРОСМОТРОВ ДЛЯ КРЕАТОРА (итоговая статистика) =====
-    # ВАЖНО: добавили проверку, что число реально есть
+
     m_id = re.search(r"(?:автор(?:а)?|креатор(?:а)?)(?:\s+с)?(?:\s+id)?\s+([a-z0-9_\-]+)", t)
-    m_thr = re.search(r"(?:больше|более|>=|не меньше|от)\s*([\d\s]+)", t)
+    thr = _parse_threshold(t)
 
-    if (
-        "сколько" in t
-        and "видео" in t
-        and "просмотр" in t
-        and m_id
-        and m_thr
-        and m_thr.group(1).strip()   # <<< ФИКС: без этого бот падает
-    ):
+    if "сколько" in t and "видео" in t and "просмотр" in t and m_id and thr:
         creator_id = m_id.group(1)
-        n = _to_int(m_thr.group(1))
-
-        if "не меньше" in t or ">=" in t or "от" in t:
-            op = ">="
-        else:
-            op = ">"
-
+        op, n = thr
         return Query(
             f"""
             SELECT COUNT(*)::bigint AS value
@@ -144,14 +150,9 @@ def build_query(text: str) -> Query | None:
 
     # ===== ПОРОГИ (без креатора) =====
     # ВАЖНО: тут тоже добавили проверку на пустое число
-    m_thr = re.search(r"(?:больше|более|>=|не меньше|от)\s*([\d\s]+)", t)
-    if "сколько" in t and "видео" in t and m_thr and m_thr.group(1).strip() and not m_id:
-        n = _to_int(m_thr.group(1))
-
-        if "не меньше" in t or ">=" in t or "от" in t:
-            op = ">="
-        else:
-            op = ">"
+    thr = _parse_threshold(t)
+    if "сколько" in t and "видео" in t and thr and not m_id:
+        op, n = thr
 
         if "просмотр" in t:
             return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE views_count {op} $1", (n,))

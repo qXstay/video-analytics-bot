@@ -1,0 +1,16 @@
+# venv / IDE
+.venv/
+.idea/
+__pycache__/
+*.pyc
+
+# env / secrets
+.env
+
+# data files
+data/
+*.json
+*.zip
+
+# logs
+*.log

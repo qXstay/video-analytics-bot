@@ -142,6 +142,17 @@ def build_query(text: str) -> Query | None:
     day = _parse_ru_date(t)
     tr = _parse_ru_time_range(t)
 
+    def _metric_value_column() -> Optional[str]:
+        if "просмотр" in t:
+            return "views_count"
+        if "лайк" in t:
+            return "likes_count"
+        if "коммент" in t:
+            return "comments_count"
+        if "репорт" in t or "жалоб" in t:
+            return "reports_count"
+        return None
+
     def _metric_delta_column() -> Optional[str]:
         if "просмотр" in t:
             return "delta_views_count"
@@ -166,27 +177,7 @@ def build_query(text: str) -> Query | None:
     if "сколько" in t and "видео" in t and ("всего" in t or "в системе" in t):
         return Query("SELECT COUNT(*)::bigint AS value FROM videos")
 
-    # ===== “сколько видео набрало больше просмотров” (без числа) =====
-    # оставляю твою логику: считаем videos.views_count > 0
-    if (
-        "сколько" in t and "видео" in t and "просмотр" in t
-        and ("больше" in t or "более" in t)
-        and thr is None
-        and not ("на сколько" in t or "насколько" in t or "вырос" in t or "увелич" in t)
-    ):
-        if m_id:
-            creator_id = m_id.group(1)
-            return Query(
-                """
-                SELECT COUNT(*)::bigint AS value
-                FROM videos
-                WHERE creator_id = $1 AND views_count > 0
-                """,
-                (creator_id,),
-            )
-        return Query("SELECT COUNT(*)::bigint AS value FROM videos WHERE views_count > 0")
-
-    # ===== ВИДЕО У КРЕАТОРА В ДИАПАЗОНЕ ДАТ =====
+    # ===== ВИДЕО У КРЕАТОРА В ДИАПАЗОНЕ ДАТ (published) =====
     if "сколько" in t and "видео" in t and m_id and dr and ("вышло" in t or "опублик" in t):
         creator_id = m_id.group(1)
         d1, d2 = dr
@@ -201,31 +192,31 @@ def build_query(text: str) -> Query | None:
             (creator_id, d1, d2),
         )
 
-    # ===== ПОРОГ ПРОСМОТРОВ ДЛЯ КРЕАТОРА (итоговая статистика) =====
-    if "сколько" in t and "видео" in t and "просмотр" in t and m_id and thr:
+    # ===== ПОРОГИ ДЛЯ КРЕАТОРА (views/likes/comments/reports) =====
+    if "сколько" in t and "видео" in t and m_id and thr:
         creator_id = m_id.group(1)
         op, n = thr
-        return Query(
-            f"""
-            SELECT COUNT(*)::bigint AS value
-            FROM videos
-            WHERE creator_id = $1
-              AND views_count {op} $2
-            """,
-            (creator_id, n),
-        )
+        col = _metric_value_column()
+        if col:
+            return Query(
+                f"""
+                SELECT COUNT(*)::bigint AS value
+                FROM videos
+                WHERE creator_id = $1
+                  AND {col} {op} $2
+                """,
+                (creator_id, n),
+            )
 
     # ===== ПОРОГИ (без креатора) =====
     if "сколько" in t and "видео" in t and thr and not m_id:
         op, n = thr
-        if "просмотр" in t:
-            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE views_count {op} $1", (n,))
-        if "лайк" in t:
-            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE likes_count {op} $1", (n,))
-        if "коммент" in t:
-            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE comments_count {op} $1", (n,))
-        if "репорт" in t or "жалоб" in t:
-            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE reports_count {op} $1", (n,))
+        col = _metric_value_column()
+        if col:
+            return Query(
+                f"SELECT COUNT(*)::bigint AS value FROM videos WHERE {col} {op} $1",
+                (n,),
+            )
 
     # ===== СУММА ПРОСМОТРОВ ПО МЕСЯЦУ =====
     if my and "видео" in t and "просмотр" in t:
@@ -252,11 +243,13 @@ def build_query(text: str) -> Query | None:
     if "сколько" in t and ("репорт" in t or "жалоб" in t) and ("всего" in t or "в системе" in t):
         return Query("SELECT COALESCE(SUM(reports_count),0)::bigint AS value FROM videos")
 
-    # ===== РОСТ ПО SNAPSHOTS: ДАТА + ВРЕМЕННОЙ ИНТЕРВАЛ (ключевой фикс) =====
-    if day and tr and ("на сколько" in t or "насколько" in t) and ("суммар" in t or "в сумме" in t) and ("вырос" in t or "увелич" in t):
+    # ===== РОСТ ПО SNAPSHOTS: ДАТА + ВРЕМЕННОЙ ИНТЕРВАЛ (ключевой тест) =====
+    # Важно: считаем сумму delta_* по тем замерам, которые попали в интервал.
+    if day and tr and ("на сколько" in t or "насколько" in t) and ("вырос" in t or "увелич" in t):
         col = _metric_delta_column()
         if col:
             t_from, t_to = tr
+            # интервал делаем полуоткрытым: [from, to)
             if m_id:
                 creator_id = m_id.group(1)
                 return Query(
@@ -267,7 +260,7 @@ def build_query(text: str) -> Query | None:
                     WHERE v.creator_id = $1
                       AND s.created_at::date = $2
                       AND s.created_at::time >= $3
-                      AND s.created_at::time <= $4
+                      AND s.created_at::time <  $4
                     """,
                     (creator_id, day, t_from, t_to),
                 )
@@ -277,14 +270,14 @@ def build_query(text: str) -> Query | None:
                 FROM video_snapshots
                 WHERE created_at::date = $1
                   AND created_at::time >= $2
-                  AND created_at::time <= $3
+                  AND created_at::time <  $3
                 """,
                 (day, t_from, t_to),
             )
 
     # ===== ДНЕВНЫЕ МЕТРИКИ ПО SNAPSHOTS (без интервала времени) =====
     if day:
-        if ("на сколько" in t or "насколько" in t) and ("в сумме" in t or "суммар" in t) and ("вырос" in t or "увелич" in t) and "видео" in t:
+        if ("на сколько" in t or "насколько" in t) and ("в сумме" in t or "суммар" in t) and ("вырос" in t or "увелич" in t):
             col = _metric_delta_column()
             if col:
                 if m_id:
@@ -305,18 +298,7 @@ def build_query(text: str) -> Query | None:
                 )
 
         if "сколько" in t and "разных" in t and "видео" in t and ("получал" in t or "получали" in t or "получало" in t) and "нов" in t:
-            # count distinct video_id с положительным delta
-            if "просмотр" in t:
-                col = "delta_views_count"
-            elif "лайк" in t:
-                col = "delta_likes_count"
-            elif "коммент" in t:
-                col = "delta_comments_count"
-            elif "репорт" in t or "жалоб" in t:
-                col = "delta_reports_count"
-            else:
-                col = None
-
+            col = _metric_delta_column()
             if col:
                 if m_id:
                     creator_id = m_id.group(1)

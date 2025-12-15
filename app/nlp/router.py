@@ -208,6 +208,28 @@ def build_query(text: str) -> Query | None:
                 (creator_id, n),
             )
 
+    # ===== СКОЛЬКО РАЗНЫХ КРЕАТОРОВ ИМЕЮТ ХОТЯ БЫ ОДНО ВИДЕО С ПОРОГОМ =====
+    # Пример: "Сколько разных креаторов имеют хотя бы одно видео, которое в итоге набрало больше 100 000 просмотров?"
+    if (
+            "сколько" in t
+            and thr
+            and not m_id
+            and ("креатор" in t or "креаторов" in t or "автор" in t or "авторов" in t)
+            and ("разн" in t or "скольких" in t)
+            and "видео" in t
+    ):
+        op, n = thr
+        col = _metric_value_column()
+        if col:
+            return Query(
+                f"""
+                    SELECT COUNT(DISTINCT creator_id)::bigint AS value
+                    FROM videos
+                    WHERE {col} {op} $1
+                    """,
+                (n,),
+            )
+
     # ===== ПОРОГИ (без креатора) =====
     if "сколько" in t and "видео" in t and thr and not m_id:
         op, n = thr

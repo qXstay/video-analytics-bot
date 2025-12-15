@@ -21,7 +21,7 @@ async def any_text_handler(message: Message, db: asyncpg.Pool):
             await message.answer("0")
             return
 
-        row = await db.fetchrow(q.sql, *q.args)
+        row = await db.fetchrow(q.sql, *q.args, timeout=5)
         value = row["value"] if row and ("value" in row) else None
 
         await message.answer(str(int(value)) if value is not None else "0")

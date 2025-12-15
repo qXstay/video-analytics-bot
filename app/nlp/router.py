@@ -97,6 +97,27 @@ def _parse_ru_month_year(text: str) -> Optional[tuple[int, int]]:
     year = int(m.group(2))
     return year, mon
 
+def _parse_ru_month_year_any(text: str) -> Optional[tuple[int, int]]:
+    t = text.lower()
+
+    # "в ноябре 2025"
+    m = re.search(
+        r"\b(?:в\s+)?(январе|феврале|марте|апреле|мае|июне|июле|августе|сентябре|октябре|ноябре|декабре)\s+(\d{4})\b",
+        t
+    )
+    if m:
+        return int(m.group(2)), MONTHS_LOC[m.group(1)]
+
+    # "ноября 2025" (ВАЖНО: не ловим "28 ноября 2025")
+    m = re.search(
+        r"(?<!\d\s)\b(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{4})\b",
+        t
+    )
+    if m:
+        return int(m.group(2)), MONTHS[m.group(1)]
+
+    return None
+
 def _parse_ru_time_range(text: str) -> Optional[Tuple[time, time]]:
     """
     Поддержка:
@@ -138,7 +159,7 @@ def build_query(text: str) -> Query | None:
     m_id = re.search(r"(?:автор(?:а)?|креатор(?:а)?)(?:\s+с)?(?:\s+id)?\s+([a-z0-9_\-]+)", t)
     thr = _parse_threshold(t)
     dr = _parse_ru_date_range(t)
-    my = _parse_ru_month_year(t)
+    my = _parse_ru_month_year_any(t)
     day = _parse_ru_date(t)
     tr = _parse_ru_time_range(t)
 
@@ -176,6 +197,32 @@ def build_query(text: str) -> Query | None:
     # ===== СКОЛЬКО ВСЕГО ВИДЕО =====
     if "сколько" in t and "видео" in t and ("всего" in t or "в системе" in t):
         return Query("SELECT COUNT(*)::bigint AS value FROM videos")
+
+    # ===== СКОЛЬКО РАЗНЫХ КАЛЕНДАРНЫХ ДНЕЙ В МЕСЯЦЕ КРЕАТОР ПУБЛИКОВАЛ ВИДЕО =====
+    # "в скольких разных календарных днях ноября 2025 года он публиковал хотя бы одно видео"
+    if (
+            m_id
+            and my
+            and ("календар" in t)
+            and ("днях" in t or "дней" in t)
+            and ("публик" in t or "опублик" in t or "выш" in t)
+            and "видео" in t
+    ):
+        creator_id = m_id.group(1)
+        y, m = my
+        start = date(y, m, 1)
+        end = date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)
+
+        return Query(
+            """
+            SELECT COUNT(DISTINCT video_created_at::date)::bigint AS value
+            FROM videos
+            WHERE creator_id = $1
+              AND video_created_at::date >= $2
+              AND video_created_at::date <  $3
+            """,
+            (creator_id, start, end),
+        )
 
     # ===== ВИДЕО У КРЕАТОРА В ДИАПАЗОНЕ ДАТ (published) =====
     if "сколько" in t and "видео" in t and m_id and dr and ("вышло" in t or "опублик" in t):
@@ -241,7 +288,7 @@ def build_query(text: str) -> Query | None:
             )
 
     # ===== СУММА ПРОСМОТРОВ ПО МЕСЯЦУ =====
-    if my and "видео" in t and "просмотр" in t:
+    if my and (not day) and "видео" in t and "просмотр" in t:
         y, m = my
         start = date(y, m, 1)
         end = date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)

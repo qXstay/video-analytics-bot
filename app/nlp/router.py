@@ -195,7 +195,7 @@ def build_query(text: str) -> Query | None:
         return Query("SELECT COUNT(*)::bigint AS value FROM video_snapshots WHERE delta_views_count < 0")
 
     # ===== СКОЛЬКО ВСЕГО ВИДЕО =====
-    if "сколько" in t and "видео" in t and ("всего" in t or "в системе" in t):
+    if "сколько" in t and "видео" in t and ("всего" in t or "в системе" in t) and "разн" not in t:
         return Query("SELECT COUNT(*)::bigint AS value FROM videos")
 
     # ===== СКОЛЬКО РАЗНЫХ КАЛЕНДАРНЫХ ДНЕЙ В МЕСЯЦЕ КРЕАТОР ПУБЛИКОВАЛ ВИДЕО =====
@@ -238,6 +238,28 @@ def build_query(text: str) -> Query | None:
             """,
             (creator_id, d1, d2),
         )
+
+    # ===== “сколько видео набрало больше <метрика>” (без числа) =====
+    # трактуем как: сколько видео имеет метрику > 0
+    if (
+            "сколько" in t and "видео" in t
+            and ("больше" in t or "более" in t)
+            and thr is None
+            and not ("на сколько" in t or "насколько" in t or "вырос" in t or "увелич" in t)
+    ):
+        col = _metric_value_column()
+        if col:
+            if m_id:
+                creator_id = m_id.group(1)
+                return Query(
+                    f"""
+                        SELECT COUNT(*)::bigint AS value
+                        FROM videos
+                        WHERE creator_id = $1 AND {col} > 0
+                        """,
+                    (creator_id,),
+                )
+            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE {col} > 0")
 
     # ===== ПОРОГИ ДЛЯ КРЕАТОРА (views/likes/comments/reports) =====
     if "сколько" in t and "видео" in t and m_id and thr:

@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, time
 from typing import Optional, Tuple
 
 @dataclass
@@ -97,73 +97,98 @@ def _parse_ru_month_year(text: str) -> Optional[tuple[int, int]]:
     year = int(m.group(2))
     return year, mon
 
+def _parse_ru_time_range(text: str) -> Optional[Tuple[time, time]]:
+    """
+    Поддержка:
+      - "с 10:00 до 15:00"
+      - "между 10:00 и 15:00"
+      - "10:00-15:00"
+      - "с 10 до 15"
+    Возвращает (t_from, t_to).
+    """
+    t = (text or "").lower()
+
+    patterns = [
+        r"(?:с)\s*(\d{1,2})(?::(\d{2}))?\s*(?:до|по|-)\s*(\d{1,2})(?::(\d{2}))?",
+        r"(?:между)\s*(\d{1,2})(?::(\d{2}))?\s*(?:и|-)\s*(\d{1,2})(?::(\d{2}))?",
+        r"\b(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?\b",
+    ]
+
+    for p in patterns:
+        m = re.search(p, t)
+        if not m:
+            continue
+
+        h1 = int(m.group(1))
+        m1 = int(m.group(2) or 0)
+        h2 = int(m.group(3))
+        m2 = int(m.group(4) or 0)
+
+        if not (0 <= h1 <= 23 and 0 <= m1 <= 59 and 0 <= h2 <= 23 and 0 <= m2 <= 59):
+            return None
+
+        return time(h1, m1), time(h2, m2)
+
+    return None
+
 def build_query(text: str) -> Query | None:
     t = (text or "").strip().lower()
 
-    # --- общие парсинги один раз ---
-    m_id = re.search(
-        r"(?:автор(?:а)?|креатор(?:а)?)(?:\s+с)?(?:\s+id)?\s*[:=]?\s*([a-z0-9_\-]+)",
-        t
-    )
-    creator_id = m_id.group(1) if m_id else None
+    # заранее парсим то, что часто нужно
+    m_id = re.search(r"(?:автор(?:а)?|креатор(?:а)?)(?:\s+с)?(?:\s+id)?\s+([a-z0-9_\-]+)", t)
+    thr = _parse_threshold(t)
+    dr = _parse_ru_date_range(t)
+    my = _parse_ru_month_year(t)
+    day = _parse_ru_date(t)
+    tr = _parse_ru_time_range(t)
 
-    thr = _parse_threshold(t)               # (op, n) или None
-    dr = _parse_ru_date_range(t)            # (d1, d2) или None
-    day = _parse_ru_date(t)                 # date или None
-    my = _parse_ru_month_year(t)            # (year, month) или None
+    def _metric_delta_column() -> Optional[str]:
+        if "просмотр" in t:
+            return "delta_views_count"
+        if "лайк" in t:
+            return "delta_likes_count"
+        if "коммент" in t:
+            return "delta_comments_count"
+        if "репорт" in t or "жалоб" in t:
+            return "delta_reports_count"
+        return None
 
-    is_views = "просмотр" in t
-    is_likes = ("лайк" in t) or ("лайков" in t)
-    is_comments = "коммент" in t
-    is_reports = ("репорт" in t) or ("жалоб" in t)
-
-    # колонка "итоговой" метрики (videos.*)
-    metric_col = None
-    if is_views:
-        metric_col = "views_count"
-    elif is_likes:
-        metric_col = "likes_count"
-    elif is_comments:
-        metric_col = "comments_count"
-    elif is_reports:
-        metric_col = "reports_count"
-
-    # колонка "дельты" (video_snapshots.delta_*)
-    delta_col = None
-    if is_views:
-        delta_col = "delta_views_count"
-    elif is_likes:
-        delta_col = "delta_likes_count"
-    elif is_comments:
-        delta_col = "delta_comments_count"
-    elif is_reports:
-        delta_col = "delta_reports_count"
-
-    # ===== 1) НЕГАТИВНЫЙ ПРИРОСТ (замеры/снапшоты) =====
-    # (по ТЗ у тебя явно фигурировали просмотры; но мы поддерживаем и другие метрики)
+    # ===== НЕГАТИВНЫЙ ПРИРОСТ (замеры/снапшоты) =====
     if (
         "сколько" in t
         and ("замер" in t or "снапшот" in t or "сним" in t or "почас" in t or "статистик" in t)
         and ("отриц" in t or "меньше" in t or "уменьш" in t)
-        and delta_col
+        and "просмотр" in t
     ):
-        return Query(
-            f"SELECT COUNT(*)::bigint AS value FROM video_snapshots WHERE {delta_col} < 0"
-        )
+        return Query("SELECT COUNT(*)::bigint AS value FROM video_snapshots WHERE delta_views_count < 0")
 
-    # ===== 2) СКОЛЬКО ВСЕГО ВИДЕО (в системе / всего) =====
-    if "сколько" in t and "видео" in t and ("всего" in t or "в системе" in t) and not metric_col:
+    # ===== СКОЛЬКО ВСЕГО ВИДЕО =====
+    if "сколько" in t and "видео" in t and ("всего" in t or "в системе" in t):
         return Query("SELECT COUNT(*)::bigint AS value FROM videos")
 
-    # ===== 3) СКОЛЬКО ВИДЕО У КРЕАТОРА (без метрики/порогов/дат) =====
-    if "сколько" in t and "видео" in t and creator_id and not metric_col and not thr and not dr:
-        return Query(
-            "SELECT COUNT(*)::bigint AS value FROM videos WHERE creator_id = $1",
-            (creator_id,),
-        )
+    # ===== “сколько видео набрало больше просмотров” (без числа) =====
+    # оставляю твою логику: считаем videos.views_count > 0
+    if (
+        "сколько" in t and "видео" in t and "просмотр" in t
+        and ("больше" in t or "более" in t)
+        and thr is None
+        and not ("на сколько" in t or "насколько" in t or "вырос" in t or "увелич" in t)
+    ):
+        if m_id:
+            creator_id = m_id.group(1)
+            return Query(
+                """
+                SELECT COUNT(*)::bigint AS value
+                FROM videos
+                WHERE creator_id = $1 AND views_count > 0
+                """,
+                (creator_id,),
+            )
+        return Query("SELECT COUNT(*)::bigint AS value FROM videos WHERE views_count > 0")
 
-    # ===== 4) ВИДЕО У КРЕАТОРА В ДИАПАЗОНЕ ДАТ (вышло/опубликовано) =====
-    if "сколько" in t and "видео" in t and creator_id and dr and ("вышло" in t or "опублик" in t):
+    # ===== ВИДЕО У КРЕАТОРА В ДИАПАЗОНЕ ДАТ =====
+    if "сколько" in t and "видео" in t and m_id and dr and ("вышло" in t or "опублик" in t):
+        creator_id = m_id.group(1)
         d1, d2 = dr
         return Query(
             """
@@ -176,54 +201,40 @@ def build_query(text: str) -> Query | None:
             (creator_id, d1, d2),
         )
 
-    # ===== 5) "Сколько видео набрало больше просмотров?" (без числа) =====
-    # Интерпретация для чекера: "больше" без порога => считаем "метрика > 0"
-    if (
-        "сколько" in t
-        and "видео" in t
-        and metric_col
-        and ("больше" in t or "более" in t)
-        and thr is None
-    ):
-        if creator_id:
-            return Query(
-                f"""
-                SELECT COUNT(*)::bigint AS value
-                FROM videos
-                WHERE creator_id = $1 AND {metric_col} > 0
-                """,
-                (creator_id,),
-            )
-        return Query(
-            f"SELECT COUNT(*)::bigint AS value FROM videos WHERE {metric_col} > 0"
-        )
-
-    # ===== 6) ПОРОГИ (с креатором / без креатора) =====
-    if "сколько" in t and "видео" in t and metric_col and thr:
+    # ===== ПОРОГ ПРОСМОТРОВ ДЛЯ КРЕАТОРА (итоговая статистика) =====
+    if "сколько" in t and "видео" in t and "просмотр" in t and m_id and thr:
+        creator_id = m_id.group(1)
         op, n = thr
-        if creator_id:
-            return Query(
-                f"""
-                SELECT COUNT(*)::bigint AS value
-                FROM videos
-                WHERE creator_id = $1
-                  AND {metric_col} {op} $2
-                """,
-                (creator_id, n),
-            )
         return Query(
-            f"SELECT COUNT(*)::bigint AS value FROM videos WHERE {metric_col} {op} $1",
-            (n,),
+            f"""
+            SELECT COUNT(*)::bigint AS value
+            FROM videos
+            WHERE creator_id = $1
+              AND views_count {op} $2
+            """,
+            (creator_id, n),
         )
 
-    # ===== 7) СУММА МЕТРИКИ ПО МЕСЯЦУ (в июне 2025) =====
-    if my and metric_col and ("видео" in t or "опублик" in t):
+    # ===== ПОРОГИ (без креатора) =====
+    if "сколько" in t and "видео" in t and thr and not m_id:
+        op, n = thr
+        if "просмотр" in t:
+            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE views_count {op} $1", (n,))
+        if "лайк" in t:
+            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE likes_count {op} $1", (n,))
+        if "коммент" in t:
+            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE comments_count {op} $1", (n,))
+        if "репорт" in t or "жалоб" in t:
+            return Query(f"SELECT COUNT(*)::bigint AS value FROM videos WHERE reports_count {op} $1", (n,))
+
+    # ===== СУММА ПРОСМОТРОВ ПО МЕСЯЦУ =====
+    if my and "видео" in t and "просмотр" in t:
         y, m = my
         start = date(y, m, 1)
         end = date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)
         return Query(
-            f"""
-            SELECT COALESCE(SUM({metric_col}),0)::bigint AS value
+            """
+            SELECT COALESCE(SUM(views_count),0)::bigint AS value
             FROM videos
             WHERE video_created_at::date >= $1
               AND video_created_at::date <  $2
@@ -231,41 +242,102 @@ def build_query(text: str) -> Query | None:
             (start, end),
         )
 
-    # ===== 8) СУММЫ ПО ВСЕЙ БАЗЕ / ПО КРЕАТОРУ =====
-    if "сколько" in t and metric_col and ("всего" in t or "в системе" in t):
-        return Query(f"SELECT COALESCE(SUM({metric_col}),0)::bigint AS value FROM videos")
+    # ===== СУММЫ ПО ВСЕЙ БАЗЕ =====
+    if "сколько" in t and "просмотр" in t and ("всего" in t or "в системе" in t):
+        return Query("SELECT COALESCE(SUM(views_count),0)::bigint AS value FROM videos")
+    if "сколько" in t and ("лайк" in t or "лайков" in t) and ("всего" in t or "в системе" in t):
+        return Query("SELECT COALESCE(SUM(likes_count),0)::bigint AS value FROM videos")
+    if "сколько" in t and "коммент" in t and ("всего" in t or "в системе" in t):
+        return Query("SELECT COALESCE(SUM(comments_count),0)::bigint AS value FROM videos")
+    if "сколько" in t and ("репорт" in t or "жалоб" in t) and ("всего" in t or "в системе" in t):
+        return Query("SELECT COALESCE(SUM(reports_count),0)::bigint AS value FROM videos")
 
-    if "сколько" in t and metric_col and creator_id and not thr:
-        return Query(
-            f"SELECT COALESCE(SUM({metric_col}),0)::bigint AS value FROM videos WHERE creator_id = $1",
-            (creator_id,),
-        )
-
-    # ===== 9) ДНЕВНЫЕ МЕТРИКИ ПО SNAPSHOTS: суммарный прирост за день =====
-    if day and delta_col:
-        if ("на сколько" in t or "насколько" in t) and ("в сумме" in t or "всего" in t) and (
-            "вырос" in t or "увелич" in t or "измен" in t
-        ):
-            return Query(
-                f"SELECT COALESCE(SUM({delta_col}),0)::bigint AS value FROM video_snapshots WHERE created_at::date = $1",
-                (day,),
-            )
-
-        # ===== 10) СКОЛЬКО РАЗНЫХ ВИДЕО ПОЛУЧИЛИ НОВЫЕ X (delta > 0) =====
-        if (
-            "сколько" in t
-            and "разных" in t
-            and "видео" in t
-            and ("получал" in t or "получали" in t or "получало" in t)
-            and "нов" in t
-        ):
+    # ===== РОСТ ПО SNAPSHOTS: ДАТА + ВРЕМЕННОЙ ИНТЕРВАЛ (ключевой фикс) =====
+    if day and tr and ("на сколько" in t or "насколько" in t) and ("суммар" in t or "в сумме" in t) and ("вырос" in t or "увелич" in t):
+        col = _metric_delta_column()
+        if col:
+            t_from, t_to = tr
+            if m_id:
+                creator_id = m_id.group(1)
+                return Query(
+                    f"""
+                    SELECT COALESCE(SUM(s.{col}),0)::bigint AS value
+                    FROM video_snapshots s
+                    JOIN videos v ON v.id = s.video_id
+                    WHERE v.creator_id = $1
+                      AND s.created_at::date = $2
+                      AND s.created_at::time >= $3
+                      AND s.created_at::time <= $4
+                    """,
+                    (creator_id, day, t_from, t_to),
+                )
             return Query(
                 f"""
-                SELECT COUNT(DISTINCT video_id)::bigint AS value
+                SELECT COALESCE(SUM({col}),0)::bigint AS value
                 FROM video_snapshots
-                WHERE created_at::date = $1 AND {delta_col} > 0
+                WHERE created_at::date = $1
+                  AND created_at::time >= $2
+                  AND created_at::time <= $3
                 """,
-                (day,),
+                (day, t_from, t_to),
             )
+
+    # ===== ДНЕВНЫЕ МЕТРИКИ ПО SNAPSHOTS (без интервала времени) =====
+    if day:
+        if ("на сколько" in t or "насколько" in t) and ("в сумме" in t or "суммар" in t) and ("вырос" in t or "увелич" in t) and "видео" in t:
+            col = _metric_delta_column()
+            if col:
+                if m_id:
+                    creator_id = m_id.group(1)
+                    return Query(
+                        f"""
+                        SELECT COALESCE(SUM(s.{col}),0)::bigint AS value
+                        FROM video_snapshots s
+                        JOIN videos v ON v.id = s.video_id
+                        WHERE v.creator_id = $1
+                          AND s.created_at::date = $2
+                        """,
+                        (creator_id, day),
+                    )
+                return Query(
+                    f"SELECT COALESCE(SUM({col}),0)::bigint AS value FROM video_snapshots WHERE created_at::date = $1",
+                    (day,),
+                )
+
+        if "сколько" in t and "разных" in t and "видео" in t and ("получал" in t or "получали" in t or "получало" in t) and "нов" in t:
+            # count distinct video_id с положительным delta
+            if "просмотр" in t:
+                col = "delta_views_count"
+            elif "лайк" in t:
+                col = "delta_likes_count"
+            elif "коммент" in t:
+                col = "delta_comments_count"
+            elif "репорт" in t or "жалоб" in t:
+                col = "delta_reports_count"
+            else:
+                col = None
+
+            if col:
+                if m_id:
+                    creator_id = m_id.group(1)
+                    return Query(
+                        f"""
+                        SELECT COUNT(DISTINCT s.video_id)::bigint AS value
+                        FROM video_snapshots s
+                        JOIN videos v ON v.id = s.video_id
+                        WHERE v.creator_id = $1
+                          AND s.created_at::date = $2
+                          AND s.{col} > 0
+                        """,
+                        (creator_id, day),
+                    )
+                return Query(
+                    f"""
+                    SELECT COUNT(DISTINCT video_id)::bigint AS value
+                    FROM video_snapshots
+                    WHERE created_at::date = $1 AND {col} > 0
+                    """,
+                    (day,),
+                )
 
     return None
